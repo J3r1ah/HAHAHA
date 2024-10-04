@@ -4,92 +4,131 @@
 #include <vector>
 #include <chrono>
 #include <thread>
+#include <memory>
+#include <algorithm>
+#include <stdexcept>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
 
-// Callback function for writing data from curl
-size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
-    ((std::string*)userp)->append((char*)contents, size * nmemb);
-    return size * nmemb;
-}
+class GifPlayer {
+private:
+    std::vector<cv::Mat> frames;
+    double frameDelay;
+    std::atomic<bool> isPaused{false};
+    std::atomic<bool> shouldExit{false};
+    std::mutex mtx;
+    std::condition_variable cv;
+    size_t currentFrame{0};
 
-// Function to download image data using libcurl
-std::string downloadImage(const std::string& url) {
-    CURL* curl;
-    CURLcode res;
-    std::string readBuffer;
-
-    curl = curl_easy_init();
-    if (curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-        res = curl_easy_perform(curl);
-        curl_easy_cleanup(curl);
-
-        if (res != CURLE_OK) {
-            std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << std::endl;
-            return "";
-        }
+    static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
+        userp->append(static_cast<char*>(contents), size * nmemb);
+        return size * nmemb;
     }
-    return readBuffer;
-}
+
+    std::string downloadImage(const std::string& url) {
+        std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), curl_easy_cleanup);
+        std::string readBuffer;
+
+        if (!curl) {
+            throw std::runtime_error("Failed to initialize CURL");
+        }
+
+        curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &readBuffer);
+        curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, 30L);
+        curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 0L); // Disable SSL verification for this example
+
+        CURLcode res = curl_easy_perform(curl.get());
+        if (res != CURLE_OK) {
+            throw std::runtime_error(std::string("curl_easy_perform() failed: ") + curl_easy_strerror(res));
+        }
+
+        return readBuffer;
+    }
+
+    double getFrameDelay(const cv::VideoCapture& cap) {
+        double delay = cap.get(cv::CAP_PROP_FPS);
+        return (delay > 0) ? 1000.0 / delay : 100.0;
+    }
+
+public:
+    GifPlayer(const std::string& url) {
+        std::cout << "Downloading image..." << std::endl;
+        std::string imageData = downloadImage(url);
+
+        std::vector<uchar> buffer(imageData.begin(), imageData.end());
+
+        std::cout << "Processing GIF frames..." << std::endl;
+        cv::VideoCapture cap;
+        cap.open(buffer);
+
+        if (!cap.isOpened()) {
+            throw std::runtime_error("Could not open the GIF.");
+        }
+
+        cv::Mat frame;
+        while (cap.read(frame)) {
+            frames.push_back(frame.clone());
+        }
+
+        if (frames.empty()) {
+            throw std::runtime_error("No frames were read from the GIF.");
+        }
+
+        frameDelay = getFrameDelay(cap);
+    }
+
+    void play() {
+        cv::namedWindow("Skull Art by haydiroket", cv::WINDOW_NORMAL);
+        cv::resizeWindow("Skull Art by haydiroket", frames[0].cols, frames[0].rows);
+
+        std::cout << "Displaying GIF. Press 'ESC' to exit, 'SPACE' to pause/resume." << std::endl;
+
+        std::thread renderThread([this]() {
+            while (!shouldExit) {
+                {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv.wait(lock, [this]() { return !isPaused || shouldExit; });
+                }
+
+                if (shouldExit) break;
+
+                cv::imshow("Skull Art by haydiroket", frames[currentFrame]);
+                currentFrame = (currentFrame + 1) % frames.size();
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(frameDelay)));
+            }
+        });
+
+        while (true) {
+            int key = cv::waitKey(1);
+            if (key == 27) { // ESC key
+                shouldExit = true;
+                cv.notify_one();
+                break;
+            } else if (key == 32) { // SPACE key
+                isPaused = !isPaused;
+                cv.notify_one();
+            }
+        }
+
+        renderThread.join();
+        cv::destroyAllWindows();
+    }
+};
 
 int main() {
-    // URL of the GIF image
-    std::string imageUrl = "https://media0.giphy.com/media/v1.Y2lkPTc5MGI3NjExZGsydGJjdHN0cGhpNXZnenY3anY3bmx1ejNvbmtocncwZjNkdWVqcSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/12hjJ7tjzvlQ08/giphy.gif";
-
-    // Download the image data
-    std::string imageData = downloadImage(imageUrl);
-    if (imageData.empty()) {
-        std::cerr << "Error: Could not download the image." << std::endl;
-        return -1;
+    try {
+        const std::string imageUrl = "https://media0.giphy.com/media/v1.Y2lkPTc5MGI3NjExZGsydGJjdHN0cGhpNXZnenY3anY3bmx1ejNvbmtocncwZjNkdWVqcSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/12hjJ7tjzvlQ08/giphy.gif";
+        GifPlayer player(imageUrl);
+        player.play();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
     }
-
-    // Convert image data to a vector of bytes
-    std::vector<uchar> buffer(imageData.begin(), imageData.end());
-
-    // Read the GIF frames
-    std::vector<cv::Mat> frames;
-    cv::VideoCapture cap;
-    cap.open(buffer);
-
-    if (!cap.isOpened()) {
-        std::cerr << "Error: Could not open the GIF." << std::endl;
-        return -1;
-    }
-
-    cv::Mat frame;
-    while (true) {
-        cap >> frame;
-        if (frame.empty()) break;
-        frames.push_back(frame.clone());
-    }
-
-    if (frames.empty()) {
-        std::cerr << "Error: No frames were read from the GIF." << std::endl;
-        return -1;
-    }
-
-    // Create a window to display the image
-    cv::namedWindow("Skull Art by haydiroket", cv::WINDOW_NORMAL);
-
-    // Resize the window to match the image dimensions
-    cv::resizeWindow("Skull Art by haydiroket", frames[0].cols, frames[0].rows);
-
-    // Display the animated GIF
-    int frameIndex = 0;
-    while (true) {
-        cv::imshow("Skull Art by haydiroket", frames[frameIndex]);
-
-        // Wait for 100ms or key press
-        int key = cv::waitKey(100);
-        if (key == 27) // ESC key
-            break;
-
-        frameIndex = (frameIndex + 1) % frames.size();
-    }
-
-    // Close the window
-    cv::destroyAllWindows();
 
     return 0;
 }
